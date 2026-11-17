@@ -2574,12 +2574,26 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
         }
         let checkpoint = self.scratch_statements.begin();
         let result = (|| {
-            while !matches!(
-                self.current_token.tag(),
-                TokenTag::RightBrace | TokenTag::Eof
-            ) {
+            let is_at_end = |parser: &Self| {
+                matches!(
+                    parser.current_token.tag(),
+                    TokenTag::RightBrace | TokenTag::Eof
+                )
+            };
+            // Most blocks have at most one statement; add it without the scratch buffer.
+            let mut first = None;
+            if !is_at_end(self) {
                 let statement = self.parse_statement(StatementContext::StatementListItem)?;
-                self.scratch_statements.append(statement);
+                if is_at_end(self) {
+                    first = Some(statement);
+                } else {
+                    self.scratch_statements.append(statement);
+                    while !is_at_end(self) {
+                        let statement =
+                            self.parse_statement(StatementContext::StatementListItem)?;
+                        self.scratch_statements.append(statement);
+                    }
+                }
             }
             let end = self.current_token.end();
             if !self.expect(
@@ -2591,7 +2605,10 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
             ) {
                 return None;
             }
-            let body = self.add_extra_from_scratch_statements(checkpoint);
+            let body = match first {
+                Some(statement) => self.ast.add_sub_range([statement]),
+                None => self.add_extra_from_scratch_statements(checkpoint),
+            };
             Some(self.ast.block_statement(Span::new(start, end), body))
         })();
         self.scratch_statements.reset(checkpoint);
@@ -12529,29 +12546,46 @@ impl<'a, C: ParserConfig> Parser<'a, C> {
     // Inline the list loop into its context-restoring wrapper.
     #[inline(always)]
     fn parse_argument_list(&mut self, checkpoint: usize) -> Option<SubRange<Argument>> {
-        while self.current_token.tag() != TokenTag::RightParen
-            && self.current_token.tag() != TokenTag::Eof
-        {
-            let argument =
-                if self.eat(TokenTag::Spread)? {
-                    let start = self.lexer.state.prev_token_end - 3;
-                    let expression =
-                        self.parse_expr(Precedence::Assignment, ParseExpressionOpts::default())?;
-                    Argument::SpreadElement(self.ast.spread_element(
-                        Span::new(start, expression.span(&self.ast).end),
-                        expression,
-                    ))
-                } else {
-                    Argument::Expr(
-                        self.parse_expr(Precedence::Assignment, ParseExpressionOpts::default())?,
-                    )
-                };
+        if self.is_at_argument_list_end() {
+            return Some(self.ast.add_sub_range([]));
+        }
+        // Most calls have one argument; add it without the scratch buffer.
+        let first = self.parse_argument()?;
+        if !self.eat(TokenTag::Comma)? || self.is_at_argument_list_end() {
+            return Some(self.ast.add_sub_range([first]));
+        }
+        self.scratch_a.append(first);
+        while !self.is_at_argument_list_end() {
+            let argument = self.parse_argument()?;
             self.scratch_a.append(argument);
             if !self.eat(TokenTag::Comma)? {
                 break;
             }
         }
         Some(self.add_extra_from_scratch_a(checkpoint))
+    }
+
+    #[inline(always)]
+    fn is_at_argument_list_end(&self) -> bool {
+        matches!(
+            self.current_token.tag(),
+            TokenTag::RightParen | TokenTag::Eof
+        )
+    }
+
+    #[inline(always)]
+    fn parse_argument(&mut self) -> Option<Argument> {
+        Some(if self.eat(TokenTag::Spread)? {
+            let start = self.lexer.state.prev_token_end - 3;
+            let expression =
+                self.parse_expr(Precedence::Assignment, ParseExpressionOpts::default())?;
+            Argument::SpreadElement(
+                self.ast
+                    .spread_element(Span::new(start, expression.span(&self.ast).end), expression),
+            )
+        } else {
+            Argument::Expr(self.parse_expr(Precedence::Assignment, ParseExpressionOpts::default())?)
+        })
     }
 
     fn parse_new_expression(&mut self) -> Option<Expr> {
